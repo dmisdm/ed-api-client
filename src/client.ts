@@ -5,11 +5,17 @@ import {
   Course,
   Thread,
   Comment,
+  CourseUser,
   EventHandler,
   EventName,
   EventPayload,
   ThreadResponse,
   UserResponse,
+  ThreadListResponse,
+  ThreadListResult,
+  UserActivityItem,
+  PostThreadParams,
+  EditThreadParams,
   Region,
   ThreadEventName,
   CommentEventName,
@@ -28,6 +34,7 @@ const REGION_HOSTS: Record<Region, string> = {
 };
 
 const DEFAULT_RECONNECT_DELAY = 5_000;
+const STATIC_FILE_BASE_URL = 'https://static.us.edusercontent.com/files/';
 
 function resolveHost(region: Region | undefined): string {
   if (!region) {
@@ -67,6 +74,42 @@ function normalizeConfig(config: ClientConfig): NormalizedClientConfig {
 function isResponseJson(res: Response): boolean {
   const contentType = res.headers.get('content-type') ?? '';
   return contentType.includes('application/json');
+}
+
+type QueryValue = string | number | boolean;
+
+interface RequestOptions {
+  params?: Record<string, QueryValue | null | undefined>;
+  json?: unknown;
+  body?: BodyInit | null;
+  headers?: Record<string, string>;
+  returnJson?: boolean;
+}
+
+function buildCommentTree(comment: any): Comment {
+  const payload = { ...(comment ?? {}) };
+  const children = Array.isArray(comment?.comments)
+    ? comment.comments.map((child: unknown) => buildCommentTree(child))
+    : [];
+  payload.comments = children;
+  return payload as Comment;
+}
+
+function buildThread(thread: any): Thread {
+  const payload = { ...(thread ?? {}) };
+  const answers = Array.isArray(thread?.answers)
+    ? thread.answers.map((answer: unknown) => buildCommentTree(answer))
+    : [];
+  const comments = Array.isArray(thread?.comments)
+    ? thread.comments.map((comment: unknown) => buildCommentTree(comment))
+    : [];
+  payload.answers = answers;
+  payload.comments = comments;
+  return payload as Thread;
+}
+
+function cloneUser(user: any): CourseUser {
+  return { ...(user ?? {}) } as CourseUser;
 }
 
 export class EdAPIClient {
@@ -156,7 +199,171 @@ export class EdAPIClient {
 
   async getThread(threadId: number): Promise<ThreadResponse> {
     await this.ensureLoggedIn();
-    return this.request<ThreadResponse>('GET', `/api/threads/${threadId}`);
+    const response = await this.request<ThreadResponse>('GET', `/api/threads/${threadId}`);
+    return {
+      thread: buildThread(response.thread),
+      users: Array.isArray(response.users) ? response.users.map((user) => cloneUser(user)) : [],
+    };
+  }
+
+  async getUserInfo(): Promise<UserResponse> {
+    await this.ensureLoggedIn();
+    return this.request<UserResponse>('GET', '/api/user');
+  }
+
+  async listUserActivity(
+    userId: number,
+    courseId: number,
+    options: { limit?: number; offset?: number; filter?: string } = {},
+  ): Promise<UserActivityItem[]> {
+    await this.ensureLoggedIn();
+    const { limit = 30, offset = 0, filter = 'all' } = options;
+    const response = await this.request<{ items?: UserActivityItem[] }>(
+      'GET',
+      `/api/users/${userId}/profile/activity`,
+      {
+        params: {
+          courseID: courseId,
+          limit,
+          offset,
+          filter,
+        },
+      },
+    );
+    return Array.isArray(response.items) ? response.items : [];
+  }
+
+  async listThreads(
+    courseId: number,
+    options: { limit?: number; offset?: number; sort?: string } = {},
+  ): Promise<ThreadListResult> {
+    await this.ensureLoggedIn();
+    const { limit = 30, offset = 0, sort = 'new' } = options;
+    const response = await this.request<ThreadListResponse>('GET', `/api/courses/${courseId}/threads`, {
+      params: {
+        limit,
+        offset,
+        sort,
+      },
+    });
+
+    const threads = Array.isArray(response.threads)
+      ? response.threads.map((thread) => buildThread(thread))
+      : [];
+    const users = Array.isArray(response.users) ? response.users.map((user) => cloneUser(user)) : [];
+    return {
+      sortKey: response.sort_key ?? '',
+      threads,
+      users,
+    };
+  }
+
+  async listUsers(courseId: number): Promise<CourseUser[]> {
+    await this.ensureLoggedIn();
+    const response = await this.request<{ users?: CourseUser[] }>(
+      'GET',
+      `/api/courses/${courseId}/analytics/users`,
+    );
+    return Array.isArray(response.users) ? response.users.map((user) => cloneUser(user)) : [];
+  }
+
+  async getCourseThread(courseId: number, threadNumber: number): Promise<Thread> {
+    await this.ensureLoggedIn();
+    const response = await this.request<{ thread: Thread }>(
+      'GET',
+      `/api/courses/${courseId}/threads/${threadNumber}`,
+    );
+    return buildThread(response.thread);
+  }
+
+  async postThread(courseId: number, params: PostThreadParams): Promise<Thread> {
+    await this.ensureLoggedIn();
+    const response = await this.request<{ thread: Thread }>('POST', `/api/courses/${courseId}/threads`, {
+      json: { thread: params },
+    });
+    return buildThread(response.thread);
+  }
+
+  async editThread(
+    threadId: number,
+    params: EditThreadParams,
+    options: { unlockThread?: boolean } = {},
+  ): Promise<Thread> {
+    await this.ensureLoggedIn();
+    const { unlockThread = true } = options;
+
+    let threadResponse = await this.request<ThreadResponse>('GET', `/api/threads/${threadId}`);
+    let threadPayload = { ...threadResponse.thread };
+
+    let relock = false;
+    if (unlockThread && threadPayload.is_locked) {
+      await this.unlockThread(threadId);
+      relock = true;
+      threadResponse = await this.request<ThreadResponse>('GET', `/api/threads/${threadId}`);
+      threadPayload = { ...threadResponse.thread };
+    }
+
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && key in threadPayload) {
+        (threadPayload as Record<string, unknown>)[key] = value;
+      }
+    }
+
+    const updated = await this.request<{ thread: Thread }>('PUT', `/api/threads/${threadId}`, {
+      json: { thread: threadPayload },
+    });
+
+    if (relock) {
+      await this.lockThread(threadId);
+    }
+
+    return buildThread(updated.thread);
+  }
+
+  async lockThread(threadId: number): Promise<void> {
+    await this.ensureLoggedIn();
+    await this.request<void>('POST', `/api/threads/${threadId}/lock`, { returnJson: false });
+  }
+
+  async unlockThread(threadId: number): Promise<void> {
+    await this.ensureLoggedIn();
+    await this.request<void>('POST', `/api/threads/${threadId}/unlock`, { returnJson: false });
+  }
+
+  async uploadFile(
+    filename: string,
+    file: Blob | ArrayBuffer | ArrayBufferView,
+    contentType: string,
+  ): Promise<string> {
+    await this.ensureLoggedIn();
+
+    let blob: Blob;
+    if (file instanceof Blob) {
+      blob = file;
+    } else if (file instanceof ArrayBuffer) {
+      blob = new Blob([file], { type: contentType });
+    } else if (ArrayBuffer.isView(file)) {
+      const view = file as ArrayBufferView & { buffer: ArrayBuffer };
+      const copy = new Uint8Array(file.byteLength);
+      copy.set(new Uint8Array(view.buffer, file.byteOffset, file.byteLength));
+      blob = new Blob([copy], { type: contentType });
+    } else {
+      throw new RequestError('Unsupported file payload type for upload.');
+    }
+
+    const formData = new FormData();
+    formData.append('attachment', blob, filename);
+
+    const response = await this.request<{ file?: { id?: string } }>('POST', '/api/files', {
+      body: formData,
+    });
+
+    const fileId = response.file?.id;
+    if (!fileId) {
+      throw new RequestError('Upload response did not include a file id.');
+    }
+
+    return `${STATIC_FILE_BASE_URL}${fileId}`;
   }
 
   async subscribe(courseIds?: number | number[]): Promise<void> {
@@ -202,17 +409,44 @@ export class EdAPIClient {
     this.config.logger.info(`Logged in as ${name}${email}`);
   }
 
-  private async request<T>(method: string, endpoint: string): Promise<T> {
-    const url = new URL(endpoint, this.config.baseUrl).toString();
-    const res = await this.config.fetchImpl(url, {
+  private async request<T>(method: string, endpoint: string, options: RequestOptions = {}): Promise<T> {
+    const { params, json, body, headers, returnJson = true } = options;
+
+    const url = new URL(endpoint, this.config.baseUrl);
+    if (params) {
+      for (const [key, value] of Object.entries(params)) {
+        if (value === undefined || value === null) {
+          continue;
+        }
+        url.searchParams.set(key, String(value));
+      }
+    }
+
+    if (json !== undefined && body !== undefined) {
+      throw new Error('Cannot specify both json and body in request options.');
+    }
+
+    const requestHeaders: Record<string, string> = {
+      Authorization: this.config.apiKey,
+      ...(headers ?? {}),
+    };
+
+    const init: RequestInit = {
       method,
-      headers: {
-        Authorization: this.config.apiKey,
-      },
-    });
+      headers: requestHeaders,
+    };
+
+    if (json !== undefined) {
+      requestHeaders['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(json);
+    } else if (body !== undefined) {
+      init.body = body;
+    }
+
+    const res = await this.config.fetchImpl(url.toString(), init);
 
     if (!res.ok) {
-      if (res.status === 400) {
+      if (res.status === 400 || res.status === 401) {
         throw new AuthenticationError('Invalid Ed API token.');
       }
       if (res.status === 403) {
@@ -221,11 +455,19 @@ export class EdAPIClient {
       if (res.status === 404) {
         throw new RequestError('Invalid API endpoint.', res.status);
       }
-      throw new RequestError(`Unexpected response: ${res.status} ${res.statusText}`, res.status);
+      const errorText = await res.text().catch(() => '');
+      const reason = errorText || res.statusText || 'Unknown error';
+      throw new RequestError(`Request to ${endpoint} failed with status ${res.status}: ${reason}`, res.status);
+    }
+
+    if (!returnJson) {
+      await res.arrayBuffer();
+      return undefined as unknown as T;
     }
 
     if (!isResponseJson(res)) {
-      throw new RequestError('Expected JSON response from Ed API.');
+      const text = await res.text();
+      throw new RequestError(`Expected JSON response from Ed API but received: ${text}`, res.status);
     }
 
     return (await res.json()) as T;

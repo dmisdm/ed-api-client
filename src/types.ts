@@ -50,6 +50,7 @@ export interface CourseUser {
   role?: string;
   course_role?: string;
   email?: string;
+  username?: string;
   tutorials?: Record<string, string>;
   [key: string]: unknown;
 }
@@ -142,6 +143,36 @@ export interface ThreadResponse {
   thread: Thread;
   users: CourseUser[];
 }
+
+export interface ThreadListResponse {
+  sort_key?: string;
+  threads?: Thread[];
+  users?: CourseUser[];
+}
+
+export interface ThreadListResult {
+  sortKey: string;
+  threads: Thread[];
+  users: CourseUser[];
+}
+
+export type UserActivityItem = Record<string, unknown>;
+
+export interface PostThreadParams {
+  type: ThreadType;
+  title: string;
+  category: string;
+  subcategory: string;
+  subsubcategory: string;
+  content: string;
+  is_pinned: boolean;
+  is_private: boolean;
+  is_anonymous: boolean;
+  is_megathread: boolean;
+  anonymous_comments: boolean;
+}
+
+export type EditThreadParams = Partial<PostThreadParams>;
 
 export type CourseCount = {
   course_id: number;
