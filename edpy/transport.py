@@ -4,7 +4,7 @@ import asyncio
 import aiohttp
 
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .errors import AuthenticationError, RequestError
 from .events import (ThreadNewEvent, ThreadUpdateEvent, ThreadDeleteEvent, CommentNewEvent,
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger('edpy.transport')
 
 API_HOST = 'us.edstem.org'
+STATIC_FILE_BASE_URL = 'https://static.us.edusercontent.com/files/'
 
 CLOSE_TYPES = (
     aiohttp.WSMsgType.CLOSE,
@@ -57,38 +58,82 @@ class Transport:
         self._ws_closed = True
     """
 
-    async def _request(self, method: str, endpoint: str, to=None):
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+        data: Any = None,
+        headers: Optional[Dict[str, str]] = None,
+        to=None,
+        return_json: bool = True,
+    ):
 
         if not self.ed_token:
-            raise RequestError('Ed API token is not provided and cannot be loaded from environment') 
+            raise RequestError('Ed API token is not provided and cannot be loaded from environment')
 
-        _log.debug('Sending request to Ed server with the following parameters: method=%s, endpoint=%s',
-                method, endpoint)
+        request_headers: Dict[str, str] = {'Authorization': self.ed_token}
+        if headers:
+            request_headers.update(headers)
+
+        url = 'https://{}{}'.format(API_HOST, endpoint)
+        _log.debug('Sending request to Ed server: method=%s endpoint=%s', method, endpoint)
 
         try:
-            async with self._session.request(method=method, url= 'https://{}{}'.format(API_HOST, endpoint),
-                                             headers={'Authorization': self.ed_token}) as res:
-                
-                _log.debug('Received response from server: status_code=%s, reason=%s', res.status, res.reason)
-                if (code := res.status) != 200:
-                    if code == 400:
-                        raise AuthenticationError('Invalid Ed API token.')
-                    if code == 403:
-                        raise RequestError('Missing permission')
-                    if code == 404:
-                        raise RequestError('Invalid API endpoint.')
+            async with self._session.request(
+                method=method,
+                url=url,
+                headers=request_headers,
+                params=params,
+                json=json,
+                data=data,
+            ) as res:
+
+                _log.debug('Received response from server: status_code=%s reason=%s', res.status, res.reason)
+
+                if res.status in (400, 401):
+                    raise AuthenticationError('Invalid Ed API token.')
+                if res.status == 403:
+                    raise RequestError('Missing permission')
+                if res.status == 404:
+                    raise RequestError('Invalid API endpoint.')
+                if res.status >= 400:
+                    payload = await res.text()
+                    raise RequestError(
+                        f'Request to {endpoint} failed with status {res.status}: {payload}'
+                    )
+
+                if not return_json:
+                    await res.read()
+                    return None
 
                 if to is str:
                     return await res.text()
 
-                json = await res.json()
-                return json if to is None else to.from_dict(json)
+                if res.content_length == 0:
+                    return None
 
-        except aiohttp.ClientConnectorError:
-            pass
-        except aiohttp.ContentTypeError as error:
-            _log.debug('Error decoding JSON: status=%s message=%s payload=%s', 
-               error.status, error.message, await res.text())
+                content_type = res.headers.get('Content-Type', '')
+                if 'json' not in content_type:
+                    text = await res.text()
+                    raise RequestError(
+                        f'Unexpected response content-type {content_type or "unknown"}: {text}'
+                    )
+
+                payload = await res.json()
+                return payload if to is None else to.from_dict(payload)
+
+        except aiohttp.ClientError as error:
+            raise RequestError(f'Failed to communicate with Ed API: {error}') from error
+
+    async def upload_file(self, filename: str, file: bytes, content_type: str) -> str:
+        form = aiohttp.FormData()
+        form.add_field('attachment', file, filename=filename, content_type=content_type)
+        response = await self._request('POST', '/api/files', data=form)
+        file_id = response['file']['id']
+        return f'{STATIC_FILE_BASE_URL}{file_id}'
 
     async def _connect(self):
 
